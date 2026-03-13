@@ -7,6 +7,9 @@ import fr.acinq.lightning.io.TcpSocket
 import fr.acinq.lightning.io.send
 import fr.acinq.lightning.io.receiveAvailable
 import fr.acinq.lightning.logging.LoggerFactory
+import fr.acinq.lightning.logging.info
+import fr.acinq.lightning.logging.warning
+import fr.acinq.lightning.logging.debug
 import fr.acinq.lightning.utils.ServerAddress
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -80,14 +83,18 @@ class KnotsDescriptorWallet(
         rpcCall("wallet.open", buildJsonObject { put("wallet_id", walletName) })
         walletId = walletName
 
-        // Import descriptor
-        rpcCall("wallet.import_descriptor", buildJsonObject {
-            put("wallet_id", walletName)
-            put("descriptor", descriptor)
-            put("range", buildJsonArray { add(range.first); add(range.second) })
-            put("timestamp", "now")
-        })
-        logger.info { "imported descriptor range=${range.first}-${range.second}" }
+        // Import descriptor (may already be imported from a previous run)
+        try {
+            rpcCall("wallet.import_descriptor", buildJsonObject {
+                put("wallet_id", walletName)
+                put("descriptor", descriptor)
+                put("range", buildJsonArray { add(range.first); add(range.second) })
+                put("timestamp", "now")
+            })
+            logger.info { "imported descriptor range=${range.first}-${range.second}" }
+        } catch (e: Exception) {
+            logger.info { "descriptor may already be imported: ${e.message}" }
+        }
 
         // Subscribe to wallet notifications
         rpcCall("wallet.subscribe", buildJsonObject { put("wallet_id", walletName) })
@@ -144,7 +151,7 @@ class KnotsDescriptorWallet(
 
         // Build WalletState from UTXOs grouped by scriptPubKey
         val addressStates = utxos.groupBy { utxo ->
-            utxo.previousTx.txOut[utxo.outputIndex].publicKeyScript.toHex()
+            utxo.previousTx.txOut[utxo.outputIndex].publicKeyScript.toString()
         }.map { (spkHex, utxoList) ->
             spkHex to WalletState.AddressState(
                 meta = WalletState.AddressMeta.Single,
@@ -178,7 +185,7 @@ class KnotsDescriptorWallet(
      */
     suspend fun broadcastTransaction(tx: Transaction): TxId {
         val result = rpcCall("blockchain.broadcast", buildJsonObject {
-            put("tx_hex", Transaction.write(tx).toHex())
+            put("tx_hex", fr.acinq.secp256k1.Hex.encode(Transaction.write(tx)))
         })
         return TxId(result.jsonObject["txid"]!!.jsonPrimitive.content)
     }
@@ -224,7 +231,7 @@ class KnotsDescriptorWallet(
                     val newline = buffer.indexOf('\n')
                     if (newline == -1) break
                     val line = buffer.substring(0, newline)
-                    buffer.delete(0, newline + 1)
+                    buffer.deleteRange(0, newline + 1)
                     if (line.isNotBlank()) processMessage(line)
                 }
             }

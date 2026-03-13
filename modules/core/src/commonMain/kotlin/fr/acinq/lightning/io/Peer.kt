@@ -189,7 +189,9 @@ class Peer(
     val watcher: IWatcher,
     val db: Databases,
     socketBuilder: TcpSocket.Builder?,
-    scope: CoroutineScope
+    scope: CoroutineScope,
+    /** Optional external wallet state flow, bypasses ElectrumMiniWallet-based SwapInWallet. */
+    val externalSwapInWalletState: StateFlow<WalletState>? = null,
 ) : CoroutineScope by scope {
     companion object {
         private const val prefix: Byte = 0x00
@@ -546,8 +548,9 @@ class Peer(
      * Warning: not thread-safe!
      */
     suspend fun startWatchSwapInWallet() {
+        val walletFlow = externalSwapInWalletState ?: swapInWallet?.wallet?.walletStateFlow
         when {
-            swapInWallet == null -> logger.warning { "swap-in wallet unavailable" }
+            walletFlow == null -> logger.warning { "swap-in wallet unavailable" }
             else -> {
                 logger.info { "starting swap-in watch job" }
                 if (swapInJob != null) {
@@ -557,7 +560,7 @@ class Peer(
                 logger.info { "waiting for peer to be ready" }
                 waitForPeerReady()
                 swapInJob = launch {
-                    swapInWallet.wallet.walletStateFlow
+                    walletFlow
                         .combine(currentTipFlow.filterNotNull()) { walletState, currentTip -> Pair(walletState, currentTip) }
                         .combine(peerFeeratesFlow.filterNotNull()) { (walletState, currentTip), feerates -> Triple(walletState, currentTip, feerates.fundingFeerate) }
                         .combine(nodeParams.liquidityPolicy) { (walletState, currentTip, feerate), policy -> TrySwapInFlow(currentTip, walletState, feerate, policy) }
