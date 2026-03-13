@@ -39,6 +39,8 @@ class KnotsDescriptorWallet(
     private var socket: TcpSocket? = null
     private var requestId = 0
     private var walletId: String? = null
+    var currentTipHeight: Int = 0
+        private set
     private val pendingRequests = mutableMapOf<Int, CompletableDeferred<JsonElement>>()
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -101,7 +103,11 @@ class KnotsDescriptorWallet(
         logger.info { "subscribed to wallet notifications" }
 
         // Subscribe to headers
-        rpcCall("blockchain.headers.subscribe", JsonNull)
+        val headerResult = rpcCall("blockchain.headers.subscribe", JsonNull)
+        headerResult.jsonObject["height"]?.jsonPrimitive?.intOrNull?.let {
+            currentTipHeight = it
+            logger.info { "current tip height: $it" }
+        }
 
         // Initial UTXO fetch
         refreshWalletState()
@@ -190,6 +196,40 @@ class KnotsDescriptorWallet(
         return TxId(result.jsonObject["txid"]!!.jsonPrimitive.content)
     }
 
+    /**
+     * Estimate fee rate in BTC/kB for a given confirmation target.
+     * Returns null if estimation is not available.
+     */
+    suspend fun estimateFee(numBlocks: Int): Double? {
+        return try {
+            val result = rpcCall("blockchain.estimatefee", buildJsonArray { add(numBlocks) })
+            val fee = result.jsonPrimitive.double
+            if (fee < 0) null else fee
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Get the number of confirmations for a wallet transaction.
+     * Returns null if the transaction is not found in the wallet.
+     */
+    suspend fun getTransactionConfirmations(txId: TxId): Int? {
+        val wid = walletId ?: return null
+        return try {
+            val txJson = rpcCall("wallet.get_transaction", buildJsonObject {
+                put("wallet_id", wid)
+                put("txid", txId.toString())
+            })
+            val height = txJson.jsonObject["height"]?.jsonPrimitive?.intOrNull ?: return 0
+            if (height <= 0) return 0
+            if (currentTipHeight <= 0) return 1 // confirmed but tip unknown
+            currentTipHeight - height + 1
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun stop() {
         socket?.close()
         _connected.value = false
@@ -272,6 +312,18 @@ class KnotsDescriptorWallet(
                     "wallet.scan_complete" -> {
                         logger.info { "scan complete" }
                         scope.launch { refreshWalletState() }
+                    }
+                    "blockchain.headers.subscribe" -> {
+                        val params = msg["params"]
+                        val height = when {
+                            params is JsonArray && params.size > 0 -> params[0].jsonObject["height"]?.jsonPrimitive?.intOrNull
+                            params is JsonObject -> params["height"]?.jsonPrimitive?.intOrNull
+                            else -> null
+                        }
+                        if (height != null) {
+                            currentTipHeight = height
+                            logger.info { "new block: height=$height" }
+                        }
                     }
                 }
             }
