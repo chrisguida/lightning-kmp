@@ -1,8 +1,13 @@
 package fr.acinq.lightning.blockchain.knots
 
+import fr.acinq.bitcoin.Bitcoin
+import fr.acinq.bitcoin.Chain
+import fr.acinq.bitcoin.Script
 import fr.acinq.bitcoin.Transaction
 import fr.acinq.bitcoin.TxId
+import fr.acinq.bitcoin.utils.Either
 import fr.acinq.lightning.blockchain.electrum.WalletState
+import fr.acinq.lightning.crypto.SwapInOnChainKeys
 import fr.acinq.lightning.io.TcpSocket
 import fr.acinq.lightning.io.send
 import fr.acinq.lightning.io.receiveAvailable
@@ -25,24 +30,66 @@ import kotlin.time.Duration.Companion.seconds
  */
 class KnotsDescriptorWallet(
     private val serverAddress: ServerAddress,
+    private val chain: Chain,
+    private val swapInKeys: SwapInOnChainKeys,
     private val scope: CoroutineScope,
     private val loggerFactory: LoggerFactory,
+    private val lookAhead: Int = 3,
 ) {
     private val logger = loggerFactory.newLogger(this::class)
 
     private val _walletStateFlow = MutableStateFlow(WalletState.empty)
     val walletStateFlow: StateFlow<WalletState> = _walletStateFlow.asStateFlow()
 
+    /** Flow of (address, index) for the current unused swap-in address. */
+    val swapInAddressFlow = MutableStateFlow<Pair<String, Int>?>(null)
+
+    /** Flow of new/confirmed transactions (parsed from notifications that include raw hex). */
+    private val _newTransactionsFlow = MutableSharedFlow<Transaction>()
+    val newTransactionsFlow: Flow<Transaction> = _newTransactionsFlow
+
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
     private var socket: TcpSocket? = null
+    private var readLoopJob: Job? = null
     private var requestId = 0
     private var walletId: String? = null
     var currentTipHeight: Int = 0
         private set
     private val pendingRequests = mutableMapOf<Int, CompletableDeferred<JsonElement>>()
     private val json = Json { ignoreUnknownKeys = true }
+
+    // Lookup from scriptPubKey hex → (address, derivation index)
+    private val scriptToAddressIndex = mutableMapOf<String, Pair<String, Int>>()
+    // How many addresses we've derived so far
+    private var derivedCount = 0
+
+    init {
+        // Watch for address rotation
+        scope.launch {
+            walletStateFlow
+                .map { it.firstUnusedDerivedAddress }
+                .filterNotNull()
+                .distinctUntilChanged()
+                .collect { (address, derived) ->
+                    logger.info { "setting current swap-in address=$address index=${derived.index}" }
+                    swapInAddressFlow.emit(address to derived.index)
+                }
+        }
+    }
+
+    /** Derive addresses from startIndex..endIndex and add to the lookup map. */
+    private fun deriveAddresses(startIndex: Int, endIndex: Int) {
+        for (i in startIndex..endIndex) {
+            val protocol = swapInKeys.getSwapInProtocol(i)
+            val address = protocol.address(chain)
+            val spkHex = protocol.serializedPubkeyScript.toHex()
+            scriptToAddressIndex[spkHex] = address to i
+        }
+        derivedCount = maxOf(derivedCount, endIndex + 1)
+        logger.debug { "derived addresses $startIndex..$endIndex (total: $derivedCount)" }
+    }
 
     /**
      * Connect to the Knots server and set up a wallet with the given descriptor.
@@ -54,6 +101,16 @@ class KnotsDescriptorWallet(
         range: Pair<Int, Int> = 0 to 1000,
         singleAddresses: List<String> = emptyList(),
     ) {
+        // Clean up any previous connection
+        readLoopJob?.cancelAndJoin()
+        readLoopJob = null
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        _connected.value = false
+        // Cancel any pending RPC calls from the old connection
+        pendingRequests.values.forEach { it.cancel() }
+        pendingRequests.clear()
+
         logger.info { "connecting to Knots server at ${serverAddress.host}:${serverAddress.port}" }
 
         val sock = socketBuilder.connect(
@@ -65,7 +122,7 @@ class KnotsDescriptorWallet(
         _connected.value = true
 
         // Start reading responses/notifications in background
-        scope.launch { readLoop(sock) }
+        readLoopJob = scope.launch { readLoop(sock) }
 
         // Handshake
         val version = rpcCall("server.version", buildJsonArray {
@@ -78,12 +135,18 @@ class KnotsDescriptorWallet(
         try {
             rpcCall("wallet.create", buildJsonObject { put("wallet_id", walletName) })
             logger.info { "created wallet: $walletName" }
-        } catch (_: Exception) {
-            logger.info { "wallet already exists, opening: $walletName" }
+        } catch (e: Exception) {
+            logger.info { "wallet already exists, opening: $walletName (create error: ${e.message})" }
         }
 
-        rpcCall("wallet.open", buildJsonObject { put("wallet_id", walletName) })
+        try {
+            rpcCall("wallet.open", buildJsonObject { put("wallet_id", walletName) })
+        } catch (e: Exception) {
+            // Wallet may already be loaded by the node at startup — that's OK
+            logger.info { "wallet.open: ${e.message} (may be already loaded)" }
+        }
         walletId = walletName
+        logger.info { "wallet opened: $walletName" }
 
         // Import descriptor (may already be imported from a previous run)
         try {
@@ -97,6 +160,9 @@ class KnotsDescriptorWallet(
         } catch (e: Exception) {
             logger.info { "descriptor may already be imported: ${e.message}" }
         }
+
+        // Pre-derive addresses for the imported range to enable UTXO → index lookup
+        deriveAddresses(range.first, lookAhead - 1)
 
         // Subscribe to wallet notifications
         rpcCall("wallet.subscribe", buildJsonObject { put("wallet_id", walletName) })
@@ -142,12 +208,21 @@ class KnotsDescriptorWallet(
                     Transaction.read(rawHex)
                 }
 
+                // Look up derivation index from scriptPubKey
+                val spkHex = previousTx.txOut[txPos].publicKeyScript.toHex()
+                val addressIndex = scriptToAddressIndex[spkHex]
+                val meta = if (addressIndex != null) {
+                    WalletState.AddressMeta.Derived(addressIndex.second)
+                } else {
+                    WalletState.AddressMeta.Single
+                }
+
                 WalletState.Utxo(
                     txId = TxId(txHash),
                     outputIndex = txPos,
                     blockHeight = height,
                     previousTx = previousTx,
-                    addressMeta = WalletState.AddressMeta.Single
+                    addressMeta = meta
                 )
             } catch (e: Exception) {
                 logger.warning { "failed to process UTXO: ${e.message}" }
@@ -155,16 +230,50 @@ class KnotsDescriptorWallet(
             }
         }
 
-        // Build WalletState from UTXOs grouped by scriptPubKey
-        val addressStates = utxos.groupBy { utxo ->
-            utxo.previousTx.txOut[utxo.outputIndex].publicKeyScript.toString()
-        }.map { (spkHex, utxoList) ->
-            spkHex to WalletState.AddressState(
-                meta = WalletState.AddressMeta.Single,
-                alreadyUsed = true,
-                utxos = utxoList
-            )
-        }.toMap()
+        // Track which addresses have UTXOs (used addresses)
+        val usedAddresses = mutableSetOf<String>()
+        val addressStates = mutableMapOf<String, WalletState.AddressState>()
+
+        // Group UTXOs by address
+        for (utxo in utxos) {
+            val spkHex = utxo.previousTx.txOut[utxo.outputIndex].publicKeyScript.toHex()
+            val addressIndex = scriptToAddressIndex[spkHex]
+            val address = addressIndex?.first ?: spkHex
+            usedAddresses.add(address)
+            val existing = addressStates[address]
+            if (existing != null) {
+                addressStates[address] = existing.copy(utxos = existing.utxos + utxo)
+            } else {
+                addressStates[address] = WalletState.AddressState(
+                    meta = utxo.addressMeta,
+                    alreadyUsed = true,
+                    utxos = listOf(utxo)
+                )
+            }
+        }
+
+        // Find the highest used index to ensure look-ahead extends beyond it
+        val highestUsedIndex = usedAddresses.mapNotNull { addr ->
+            scriptToAddressIndex.values.firstOrNull { it.first == addr }?.second
+        }.maxOrNull() ?: -1
+
+        // Ensure we have enough derived addresses for look-ahead
+        val neededUpTo = highestUsedIndex + lookAhead
+        if (neededUpTo >= derivedCount) {
+            deriveAddresses(derivedCount, neededUpTo)
+        }
+
+        // Add unused derived addresses (for look-ahead / firstUnusedDerivedAddress)
+        for ((_, addressAndIndex) in scriptToAddressIndex) {
+            val (address, index) = addressAndIndex
+            if (address !in usedAddresses && index <= neededUpTo) {
+                addressStates[address] = WalletState.AddressState(
+                    meta = WalletState.AddressMeta.Derived(index),
+                    alreadyUsed = false,
+                    utxos = emptyList()
+                )
+            }
+        }
 
         _walletStateFlow.value = WalletState(addressStates)
         logger.info { "wallet updated: ${utxos.size} utxos, balance=${_walletStateFlow.value.totalBalance}" }
@@ -302,7 +411,23 @@ class KnotsDescriptorWallet(
                 when (method) {
                     "wallet.tx_added", "wallet.tx_confirmed", "wallet.balance_changed" -> {
                         logger.info { "wallet notification: $method" }
-                        scope.launch { refreshWalletState() }
+                        // Parse raw tx hex from notification if present
+                        val params = msg["params"]
+                        val txHex = when {
+                            params is JsonArray && params.size > 1 -> params[1].jsonObject["hex"]?.jsonPrimitive?.contentOrNull
+                            params is JsonObject -> params["hex"]?.jsonPrimitive?.contentOrNull
+                            else -> null
+                        }
+                        scope.launch {
+                            if (txHex != null) {
+                                try {
+                                    _newTransactionsFlow.emit(Transaction.read(txHex))
+                                } catch (e: Exception) {
+                                    logger.warning { "failed to parse tx from notification: ${e.message}" }
+                                }
+                            }
+                            refreshWalletState()
+                        }
                     }
                     "wallet.scan_progress" -> {
                         val params = msg["params"]?.jsonObject

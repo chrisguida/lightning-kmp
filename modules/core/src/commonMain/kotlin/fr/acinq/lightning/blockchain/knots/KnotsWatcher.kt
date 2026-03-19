@@ -28,10 +28,16 @@ class KnotsWatcher(
     private val watches = mutableSetOf<Watch>()
 
     init {
-        // Monitor wallet state changes and check watches
+        // Monitor wallet state changes and check confirmation watches
         scope.launch {
-            wallet.walletStateFlow.collect { walletState ->
+            wallet.walletStateFlow.collect {
                 checkWatches()
+            }
+        }
+        // Monitor new transactions for spend detection
+        scope.launch {
+            wallet.newTransactionsFlow.collect { tx ->
+                checkSpendWatches(tx)
             }
         }
     }
@@ -72,15 +78,26 @@ class KnotsWatcher(
                     }
                 }
                 is WatchSpent -> {
-                    // Check if the watched output has been spent by querying
-                    // wallet transactions for inputs matching the watched outpoint
-                    // TODO: implement spend detection via wallet transaction history
-                    // For now, this is a placeholder — spend detection requires
-                    // scanning wallet tx inputs, which we'll add when needed
+                    // Spend detection handled by checkSpendWatches via newTransactionsFlow
                 }
             }
         }
 
+        watches.removeAll(triggeredWatches)
+    }
+
+    private suspend fun checkSpendWatches(tx: Transaction) {
+        val triggeredWatches = mutableSetOf<Watch>()
+        for (input in tx.txIn) {
+            val outPoint = input.outPoint
+            watches.filterIsInstance<WatchSpent>()
+                .filter { it.txId == outPoint.txid && it.outputIndex == outPoint.index.toInt() }
+                .forEach { watch ->
+                    logger.info { "watch spent triggered: output ${watch.txId}:${watch.outputIndex} spent by ${tx.txid}" }
+                    _notificationsFlow.emit(WatchSpentTriggered(watch.channelId, watch.event, tx))
+                    triggeredWatches.add(watch)
+                }
+        }
         watches.removeAll(triggeredWatches)
     }
 }
