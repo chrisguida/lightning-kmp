@@ -55,8 +55,11 @@ class KnotsDescriptorWallet(
     private var readLoopJob: Job? = null
     private var requestId = 0
     private var walletId: String? = null
-    var currentTipHeight: Int = 0
-        private set
+    private val _currentTipFlow = MutableStateFlow(0)
+    val currentTipFlow: StateFlow<Int> = _currentTipFlow.asStateFlow()
+    var currentTipHeight: Int
+        get() = _currentTipFlow.value
+        private set(value) { _currentTipFlow.value = value }
     private val pendingRequests = mutableMapOf<Int, CompletableDeferred<JsonElement>>()
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -299,10 +302,11 @@ class KnotsDescriptorWallet(
      * Broadcast a transaction.
      */
     suspend fun broadcastTransaction(tx: Transaction): TxId {
-        val result = rpcCall("blockchain.broadcast", buildJsonObject {
-            put("tx_hex", fr.acinq.secp256k1.Hex.encode(Transaction.write(tx)))
-        })
-        return TxId(result.jsonObject["txid"]!!.jsonPrimitive.content)
+        val hexTx = fr.acinq.secp256k1.Hex.encode(Transaction.write(tx))
+        val result = rpcCall("blockchain.transaction.broadcast", buildJsonArray { add(hexTx) })
+        // Standard Electrum returns the txid as a plain string
+        val txid = if (result is JsonPrimitive) result.content else result.jsonObject["txid"]!!.jsonPrimitive.content
+        return TxId(txid)
     }
 
     /**

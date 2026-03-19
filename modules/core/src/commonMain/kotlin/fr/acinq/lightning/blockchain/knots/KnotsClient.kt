@@ -6,12 +6,17 @@ import fr.acinq.lightning.blockchain.IClient
 import fr.acinq.lightning.blockchain.fee.FeeratePerByte
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.utils.sat
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * IClient implementation backed by a KnotsDescriptorWallet connection.
- * Provides fee rate estimation and transaction confirmation lookups.
+ * Provides fee rate estimation, transaction confirmation lookups,
+ * and real-time tip height from blockchain.headers.subscribe.
  */
 class KnotsClient(private val wallet: KnotsDescriptorWallet) : IClient {
+
+    /** Real-time block tip height from Knots header subscription. */
+    val currentTipFlow: StateFlow<Int> = wallet.currentTipFlow
 
     override suspend fun getConfirmations(txId: TxId): Int? {
         return wallet.getTransactionConfirmations(txId)

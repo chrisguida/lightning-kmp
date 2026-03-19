@@ -9,6 +9,7 @@ import fr.acinq.lightning.blockchain.IWatcher
 import fr.acinq.lightning.blockchain.WatchTriggered
 import fr.acinq.lightning.blockchain.computeSpliceCpfpFeerate
 import fr.acinq.lightning.blockchain.electrum.*
+import fr.acinq.lightning.blockchain.knots.KnotsClient
 import fr.acinq.lightning.blockchain.fee.FeeratePerByte
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.blockchain.fee.OnChainFeerates
@@ -293,6 +294,9 @@ class Peer(
                     .collect { msg ->
                         currentTipFlow.value = msg.blockHeight
                     }
+                is KnotsClient -> client.currentTipFlow
+                    .filter { it > 0 }
+                    .collect { currentTipFlow.value = it }
                 is MempoolSpaceClient -> while (true) {
                     runCatching {
                         client.getBlockTipHeight()?.let { currentBlockHeight ->
