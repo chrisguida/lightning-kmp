@@ -53,7 +53,12 @@ class KnotsWatcher(
 
     override suspend fun publish(tx: Transaction) {
         logger.info { "publishing tx ${tx.txid}" }
-        wallet.broadcastTransaction(tx)
+        try {
+            wallet.broadcastTransaction(tx)
+        } catch (e: Exception) {
+            // Broadcasting an already-confirmed tx is expected to fail — not an error
+            logger.info { "broadcast failed (may already be confirmed): ${e.message}" }
+        }
     }
 
     private suspend fun checkWatches() {

@@ -605,6 +605,13 @@ class Peer(
         if (result == null) {
             logger.info { "peer ready timeout elapsed, not all channels are synced but proceeding anyway" }
         }
+        // After channels are synced, wait for the reestablish follow-up messages (ChannelReady,
+        // TxSignatures) to be exchanged before allowing splice attempts. Without this delay,
+        // Stfu can arrive at the peer before it finishes processing the reestablish, causing
+        // the splice to hang.
+        if (_channels.isNotEmpty()) {
+            delay(5.seconds)
+        }
     }
 
     /**
